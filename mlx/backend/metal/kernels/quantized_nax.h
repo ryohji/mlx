@@ -1935,6 +1935,7 @@ template <
 template <
     typename T,
     const int group_size,
+    const int bits,
     const bool aligned_N,
     const int BM = 64,
     const int BK = 64,
