@@ -1687,15 +1687,10 @@ METAL_FUNC void sym1bit_qmm_t_nax_tgp_impl(
           if constexpr (kAlignedM.value) {
             Atile.load(x + kk1, K);
           } else {
-            Atile.load_safe(x + kk1, K, sgp_sm);
+            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
           }
 
-          if constexpr (kAlignedN.value) {
-            Btile.template load<T, BK_padded, 1>(Ws + tn + kk1 * (BK_padded));
-          } else {
-            Btile.template load_safe<T, BK_padded, 1>(
-                Ws + tn + kk1 * (BK_padded), sgp_sn);
-          }
+          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
 
           tile_matmad_nax(
               Dtile,
@@ -1707,19 +1702,21 @@ METAL_FUNC void sym1bit_qmm_t_nax_tgp_impl(
           (void)compiler_barrier;
         }
 
+        x += BK;
         loader_w.next();
+      }
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      if constexpr (kAlignedM.value && kAlignedN.value) {
+        Dtile.store(y + tm * N + tn, N);
+      } else if (kAlignedM.value && sgp_sn == SN) {
+        Dtile.store(y + tm * N + tn, N);
+      } else {
+        Dtile.store_safe(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
       }
     });
   });
-
-  if constexpr (!aligned_N) {
-    if (y_col + tn >= N) {
-      return;
-    }
-  }
-
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  Dtile.store_safe(y + tm * N + tn, N, sgp_sm, sgp_sn);
 }
 
 // ---------------------------------------------------------------------------
