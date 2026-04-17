@@ -16,6 +16,13 @@ namespace mlx::core {
 
 namespace {
 
+// Return kernel name prefix for a given quantization mode.
+inline std::string mode_prefix(const std::string& mode) {
+  if (mode == "affine") return "affine_";
+  if (mode == "sym1bit") return "sym1bit_";
+  return "fp_";
+}
+
 template <typename... Args>
 auto get_quantized_kernel_wrapped(
     metal::Device& d,
@@ -27,7 +34,7 @@ auto get_quantized_kernel_wrapped(
     int bits,
     Args... args) {
   std::string template_def;
-  std::string fname = ((mode == "affine") ? "affine_" : "fp_") + func;
+  std::string fname = mode_prefix(mode) + func;
   template_def = get_template_definition(
       name, fname, type, group_size, bits, std::forward<Args>(args)...);
   return get_quantized_kernel(d, name, template_def, mode);
@@ -44,7 +51,7 @@ auto get_qmm_nax_kernel_wrapped(
     int bits,
     Args... args) {
   std::string template_def;
-  std::string fname = ((mode == "affine") ? "affine_" : "fp_") + func;
+  std::string fname = mode_prefix(mode) + func;
   template_def = get_template_definition(
       name, fname, type, group_size, bits, std::forward<Args>(args)...);
   return get_qmm_nax_kernel(d, name, template_def, mode);
@@ -1400,6 +1407,14 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     biases = ensure_row_contiguous_matrix(inputs[3], d, s);
   }
 
+  // sym1bit only supports transposed-weights (y = x @ w.T) on GPU.
+  // qvm / qvm_split_k paths do not have sym1bit kernels.
+  if (mode_ == QuantizationMode::Sym1Bit && !transpose_) {
+    throw std::runtime_error(
+        "[sym1bit QuantizedMatmul::eval_gpu] sym1bit GPU inference requires "
+        "transpose=true (y = x @ w.T layout).");
+  }
+
   // Extract the matmul shapes
   bool non_batched = w.ndim() == 2 && x.flags().row_contiguous;
   int K = x.shape(-1);
@@ -1410,9 +1425,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto mode = quantization_mode_to_string(mode_);
   // It is a matrix matrix product.
   if (M >= vector_limit) {
-    // Use split-K qmm for small M with transposed weights (non-batched only)
+    // Use split-K qmm for small M with transposed weights (non-batched only).
+    // sym1bit has no splitk kernel; fall through to qmm (NAX path).
     int B = out.size() / M / N;
-    if (transpose_ && B == 1) {
+    if (transpose_ && B == 1 && mode != "sym1bit") {
       qmm_splitk(
           x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
       return;
@@ -1657,6 +1673,13 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 void fast::Quantize::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  // sym1bit quantize/dequantize has no Metal kernel; quantization is offline.
+  if (mode_ == QuantizationMode::Sym1Bit) {
+    throw std::runtime_error(
+        "[sym1bit Quantize::eval_gpu] sym1bit quantization/dequantization "
+        "is not supported on Metal GPU. Perform weight quantization on CPU.");
+  }
+
   auto& w_pre = inputs[0];
   auto& out = outputs[0];
   out.set_data(allocator::malloc(out.nbytes()));

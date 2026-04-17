@@ -665,6 +665,175 @@ dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// sym1bit dequantize: select(-alpha, +alpha, bit), alpha = scale * 0.5
+// No bias parameter — saves 1 mul and 8 adds per 8 weights.
+// ---------------------------------------------------------------------------
+
+template <typename U, int N>
+inline void dequantize_sym1bit(
+    const device uint8_t* w, U scale, threadgroup U* w_local) {
+  const U alpha = scale * U(0.5f);
+  for (int i = 0; i < (N / 8); i++) {
+    uint8_t wb = w[i];
+    w_local[8 * i]     = select(-alpha, alpha, bool(wb & 0x01));
+    w_local[8 * i + 1] = select(-alpha, alpha, bool(wb & 0x02));
+    w_local[8 * i + 2] = select(-alpha, alpha, bool(wb & 0x04));
+    w_local[8 * i + 3] = select(-alpha, alpha, bool(wb & 0x08));
+    w_local[8 * i + 4] = select(-alpha, alpha, bool(wb & 0x10));
+    w_local[8 * i + 5] = select(-alpha, alpha, bool(wb & 0x20));
+    w_local[8 * i + 6] = select(-alpha, alpha, bool(wb & 0x40));
+    w_local[8 * i + 7] = select(-alpha, alpha, bool(wb & 0x80));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sym1BitQuantizedBlockLoader — mirrors QuantizedBlockLoader without biases
+// ---------------------------------------------------------------------------
+
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size,
+    short group_size>
+struct Sym1BitQuantizedBlockLoader {
+  static_assert(
+      BCOLS <= group_size,
+      "The group size should be larger than the columns");
+  static_assert(
+      group_size % BCOLS == 0,
+      "The group size should be divisible by the columns");
+
+  MLX_MTL_CONST short bits = 1;
+  MLX_MTL_CONST short pack_factor = get_pack_factor<1, 8>();  // 8
+  MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack<1>(); // 1
+  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
+  MLX_MTL_CONST short n_reads =
+      (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
+  MLX_MTL_CONST short group_steps = group_size / BCOLS;
+
+  const int src_ld;
+  const int tile_stride;
+  short group_step_cnt;
+  const int group_stride;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  const device T* scales;
+
+  Sym1BitQuantizedBlockLoader(
+      const device uint8_t* src_,
+      const device T* scales_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      : src_ld(src_ld_),
+        tile_stride(
+            reduction_dim ? BCOLS_PACKED * bytes_per_pack
+                          : BROWS * src_ld * bytes_per_pack / pack_factor),
+        group_step_cnt(0),
+        group_stride(BROWS * src_ld / group_size),
+        thread_idx(simd_group_id * 32 + simd_lane_id),
+        bi(n_reads * thread_idx / BCOLS_PACKED),
+        bj((n_reads * thread_idx) % BCOLS_PACKED),
+        dst(dst_ + bi * dst_ld + bj * pack_factor),
+        src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
+            bj * bytes_per_pack),
+        scales(scales_ + bi * src_ld / group_size) {}
+
+  void load_unsafe() const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    T scale = *scales;
+    for (int i = 0; i < n_reads; i++) {
+      dequantize_sym1bit<T, pack_factor>(
+          src + i * bytes_per_pack, scale, dst + i * pack_factor);
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    if (reduction_dim == 1 && bi >= src_tile_dim.x) {
+      for (int i = 0; i < n_reads * pack_factor; i++) dst[i] = T(0);
+      return;
+    }
+    if (reduction_dim == 0 && bi >= src_tile_dim.y) {
+      for (int i = 0; i < n_reads * pack_factor; i++) dst[i] = T(0);
+      return;
+    }
+    T scale = *scales;
+    for (int i = 0; i < n_reads; i++) {
+      dequantize_sym1bit<T, pack_factor>(
+          (device uint8_t*)(src + i * bytes_per_pack),
+          scale,
+          dst + i * pack_factor);
+    }
+  }
+
+  void next() {
+    src += tile_stride;
+    if (reduction_dim == 1) {
+      if (group_steps > 1) {
+        group_step_cnt++;
+        if (group_step_cnt == group_steps) {
+          group_step_cnt = 0;
+          scales++;
+        }
+      } else {
+        scales++;
+      }
+    } else {
+      scales += group_stride;
+    }
+  }
+};
+
+// adjust_matrix_offsets for sym1bit (no biases)
+template <typename T>
+METAL_FUNC void adjust_matrix_offsets_sym1bit(
+    const device T*& x,
+    const device uint32_t*& w,
+    const device T*& scales,
+    device T*& y,
+    int output_stride,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* s_strides,
+    uint3 tid [[threadgroup_position_in_grid]]) {
+  uint32_t x_idx = tid.z;
+  uint32_t w_idx = tid.z;
+  if (x_batch_ndims == 1) {
+    x += x_idx * x_strides[0];
+  } else {
+    x += elem_to_loc(x_idx, x_shape, x_strides, x_batch_ndims);
+  }
+  if (w_batch_ndims == 1) {
+    w += w_idx * w_strides[0];
+    scales += w_idx * s_strides[0];
+  } else {
+    ulong2 idx = elem_to_loc_broadcast(
+        w_idx, w_shape, w_strides, s_strides, w_batch_ndims);
+    w += idx.x;
+    scales += idx.y;
+  }
+  y += tid.z * output_stride;
+}
+
 template <
     typename T,
     short BROWS,
@@ -1413,10 +1582,359 @@ template <
       w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
+// ---------------------------------------------------------------------------
+// sym1bit_qmm_t_nax_tgp_impl — like qmm_t_nax_tgp_impl with Sym1BitLoader
+// biases buffer removed; x/y shift by one buffer slot in calling kernel.
+// ---------------------------------------------------------------------------
+
 template <
     typename T,
     const int group_size,
-    const int bits,
+    const bool aligned_N,
+    const int BM,
+    const int BK,
+    const int BN,
+    const int WM,
+    const int WN>
+METAL_FUNC void sym1bit_qmm_t_nax_tgp_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* x,
+    device T* y,
+    threadgroup T* Ws,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
+  static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
+
+  (void)lid;
+
+  constexpr int bits = 1;
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using loader_w_t = Sym1BitQuantizedBlockLoader<
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+
+  auto wl = (const device uint8_t*)w;
+
+  x += y_row * static_cast<int64_t>(K);
+  wl += y_col * K_w;
+  scales += y_col * K_g;
+  y += y_row * static_cast<int64_t>(N) + y_col;
+
+  loader_w_t loader_w(wl, scales, K, Ws, simd_gid, simd_lid);
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  const short tm = SM * (simd_gid / WN);
+  const short tn = SN * (simd_gid % WN);
+
+  constexpr bool transpose_a = false;
+  constexpr bool transpose_b = true;
+
+  const short sgp_sm = min(SM, short(M - (y_row + tm)));
+  const bool is_unaligned_sm = (sgp_sm != SM);
+
+  const short sgp_sn = aligned_N ? SN : min(SN, short(N - (y_col + tn)));
+
+  const short tgp_bn = aligned_N ? BN : min(BN, int(N - (y_col)));
+  const bool is_unaligned_bn = aligned_N ? false : (tgp_bn != BN);
+
+  using AccumType = float;
+
+  NAXTile<AccumType, TM, TN> Dtile;
+  Dtile.clear();
+
+  x += tm * K;
+
+  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
+    dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
+      for (int k = 0; k < K; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (kAlignedN.value) {
+          loader_w.load_unsafe();
+        } else {
+          loader_w.load_safe(short2(BK, tgp_bn));
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        STEEL_PRAGMA_NO_UNROLL
+        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          NAXTile<T, TM, TK> Atile;
+          NAXTile<T, TN, TK> Btile;
+
+          volatile int compiler_barrier;
+
+          if constexpr (kAlignedM.value) {
+            Atile.load(x + kk1, K);
+          } else {
+            Atile.load_safe(x + kk1, K, sgp_sm);
+          }
+
+          if constexpr (kAlignedN.value) {
+            Btile.template load<T, BK_padded, 1>(Ws + tn + kk1 * (BK_padded));
+          } else {
+            Btile.template load_safe<T, BK_padded, 1>(
+                Ws + tn + kk1 * (BK_padded), sgp_sn);
+          }
+
+          tile_matmad_nax(
+              Dtile,
+              Atile,
+              metal::bool_constant<transpose_a>{},
+              Btile,
+              metal::bool_constant<transpose_b>{});
+
+          (void)compiler_barrier;
+        }
+
+        loader_w.next();
+      }
+    });
+  });
+
+  if constexpr (!aligned_N) {
+    if (y_col + tn >= N) {
+      return;
+    }
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  Dtile.store_safe(y + tm * N + tn, N, sgp_sm, sgp_sn);
+}
+
+// ---------------------------------------------------------------------------
+// sym1bit_qmm_n_nax_tgp_impl — like qmm_n_nax_tgp_impl with Sym1BitLoader
+// ---------------------------------------------------------------------------
+
+template <
+    typename T,
+    const int group_size,
+    const int BM,
+    const int BK,
+    const int BN,
+    const int WM,
+    const int WN>
+METAL_FUNC void sym1bit_qmm_n_nax_tgp_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* x,
+    device T* y,
+    threadgroup T* Ws,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  (void)lid;
+  (void)M;
+
+  static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
+  static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
+
+  constexpr int bits = 1;
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BN_padded = (BN + 16 / sizeof(T));
+
+  using loader_w_t = Sym1BitQuantizedBlockLoader<
+      T, BK, BN, BN_padded, 0, WM * WN * SIMD_SIZE, group_size>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+
+  auto wl = (const device uint8_t*)w;
+
+  x += y_row * static_cast<int64_t>(K);
+  wl += y_col * K_w;
+  scales += y_col * K_g;
+  y += y_row * static_cast<int64_t>(N) + y_col;
+
+  loader_w_t loader_w(wl, scales, K, Ws, simd_gid, simd_lid);
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  const short tm = SM * (simd_gid / WN);
+  const short tn = SN * (simd_gid % WN);
+  const short ldb_tgp = BN_padded;
+
+  constexpr bool transpose_a = false;
+  constexpr bool transpose_b = false;
+
+  using AccumType = float;
+
+  NAXTile<AccumType, TM, TN> Dtile;
+  Dtile.clear();
+
+  x += tm * K;
+
+  for (int k = 0; k < K; k += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    loader_w.load_unsafe();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    STEEL_PRAGMA_NO_UNROLL
+    for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+      NAXTile<T, TM, TK> Atile;
+      NAXTile<T, TK, TN> Btile;
+
+      volatile int compiler_barrier;
+
+      Atile.load(x + kk1, K);
+      Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * ldb_tgp);
+
+      tile_matmad_nax(
+          Dtile,
+          Atile,
+          metal::bool_constant<transpose_a>{},
+          Btile,
+          metal::bool_constant<transpose_b>{});
+
+      (void)compiler_barrier;
+    }
+
+    x += BK;
+    loader_w.next();
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  Dtile.store(y + tm * N + tn, N);
+}
+
+// ---------------------------------------------------------------------------
+// sym1bit kernel entry points — buffer layout: w[0], scales[1], x[2], y[3]
+// (biases absent; indices shift by -1 vs. affine equivalents)
+// ---------------------------------------------------------------------------
+
+// bits is kept as a template parameter so the kernel name and template
+// instantiation string match what the dispatch layer generates.
+// Only bits==1 is valid; enforced by static_assert.
+template <
+    typename T,
+    const int group_size,
+    const int bits,           // must be 1
+    const bool aligned_N,
+    const bool batched,
+    const int BM = 64,
+    const int BK = 64,
+    const int BN = 64,
+    const int WM = 2,
+    const int WN = 2>
+[[kernel]] void sym1bit_qmm_t_nax(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales  [[buffer(1)]],
+    const device T* x       [[buffer(2)]],
+    device T* y             [[buffer(3)]],
+    const constant int& K   [[buffer(4)]],
+    const constant int& N   [[buffer(5)]],
+    const constant int& M   [[buffer(6)]],
+    const constant int& x_batch_ndims        [[buffer(7)]],
+    const constant int* x_shape              [[buffer(8)]],
+    const constant int64_t* x_strides        [[buffer(9)]],
+    const constant int& w_batch_ndims        [[buffer(10)]],
+    const constant int* w_shape              [[buffer(11)]],
+    const constant int64_t* w_strides        [[buffer(12)]],
+    const constant int64_t* s_strides        [[buffer(13)]],
+    uint3 tid    [[threadgroup_position_in_grid]],
+    uint lid     [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(bits == 1, "sym1bit_qmm_t_nax requires bits==1");
+  (void)lid;
+
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  threadgroup T Ws[BN * BK_padded];
+
+  if (batched) {
+    adjust_matrix_offsets_sym1bit<T>(
+        x, w, scales, y, M * N,
+        x_batch_ndims, x_shape, x_strides,
+        w_batch_ndims, w_shape, w_strides, s_strides, tid);
+  }
+  sym1bit_qmm_t_nax_tgp_impl<T, group_size, aligned_N, BM, BK, BN, WM, WN>(
+      w, scales, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+}
+
+template <
+    typename T,
+    const int group_size,
+    const int bits,           // must be 1
+    const bool batched,
+    const int BM = 64,
+    const int BK = 64,
+    const int BN = 64,
+    const int WM = 2,
+    const int WN = 2>
+[[kernel]] void sym1bit_qmm_n_nax(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales  [[buffer(1)]],
+    const device T* x       [[buffer(2)]],
+    device T* y             [[buffer(3)]],
+    const constant int& K   [[buffer(4)]],
+    const constant int& N   [[buffer(5)]],
+    const constant int& M   [[buffer(6)]],
+    const constant int& x_batch_ndims        [[buffer(7)]],
+    const constant int* x_shape              [[buffer(8)]],
+    const constant int64_t* x_strides        [[buffer(9)]],
+    const constant int& w_batch_ndims        [[buffer(10)]],
+    const constant int* w_shape              [[buffer(11)]],
+    const constant int64_t* w_strides        [[buffer(12)]],
+    const constant int64_t* s_strides        [[buffer(13)]],
+    uint3 tid    [[threadgroup_position_in_grid]],
+    uint lid     [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(bits == 1, "sym1bit_qmm_n_nax requires bits==1");
+  (void)lid;
+
+  constexpr int BN_padded = (BN + 16 / sizeof(T));
+
+  threadgroup T Ws[BK * BN_padded];
+
+  if (batched) {
+    adjust_matrix_offsets_sym1bit<T>(
+        x, w, scales, y, M * N,
+        x_batch_ndims, x_shape, x_strides,
+        w_batch_ndims, w_shape, w_strides, s_strides, tid);
+  }
+
+  sym1bit_qmm_n_nax_tgp_impl<T, group_size, BM, BK, BN, WM, WN>(
+      w, scales, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+}
+
+template <
+    typename T,
+    const int group_size,
     const bool aligned_N,
     const int BM = 64,
     const int BK = 64,

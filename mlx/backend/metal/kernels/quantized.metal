@@ -156,4 +156,25 @@
   instantiate_quantized_groups(6) \
   instantiate_quantized_groups(8)
 
-instantiate_quantized_all() // clang-format on
+instantiate_quantized_all()
+
+// sym1bit qmv kernels — bits is always 1; kept as template param for dispatch compat
+#define instantiate_sym1bit_qmv(type, group_size, batched) \
+  instantiate_kernel( \
+      "sym1bit_qmv_fast_" #type "_gs_" #group_size "_b_1_batch_" #batched, \
+      sym1bit_qmv_fast, type, group_size, 1, batched) \
+  instantiate_kernel( \
+      "sym1bit_qmv_" #type "_gs_" #group_size "_b_1_batch_" #batched, \
+      sym1bit_qmv, type, group_size, 1, batched)
+
+#define instantiate_sym1bit_qmv_types(group_size) \
+  instantiate_sym1bit_qmv(float, group_size, 0) \
+  instantiate_sym1bit_qmv(float, group_size, 1) \
+  instantiate_sym1bit_qmv(float16_t, group_size, 0) \
+  instantiate_sym1bit_qmv(float16_t, group_size, 1) \
+  instantiate_sym1bit_qmv(bfloat16_t, group_size, 0) \
+  instantiate_sym1bit_qmv(bfloat16_t, group_size, 1)
+
+instantiate_sym1bit_qmv_types(128)
+instantiate_sym1bit_qmv_types(64)
+// clang-format on

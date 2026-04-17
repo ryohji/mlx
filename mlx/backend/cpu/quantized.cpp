@@ -955,6 +955,34 @@ void QuantizedMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
                       transpose_ = transpose_]() mutable {
       _qmm_dispatch(out, x, w, scales, biases, group_size_, bits_, transpose_);
     });
+  } else if (mode_ == QuantizationMode::Sym1Bit) {
+    // Synthesize bias = -scale/2 from scales; reuse affine 1-bit CPU path
+    encoder.dispatch([out = array::unsafe_weak_copy(out),
+                      x = array::unsafe_weak_copy(x),
+                      w = array::unsafe_weak_copy(w),
+                      scales = array::unsafe_weak_copy(scales),
+                      group_size_ = group_size_,
+                      bits_ = bits_,
+                      transpose_ = transpose_]() mutable {
+      // Build a biases array = -scales * 0.5 (same shape/dtype as scales)
+      auto& s = scales;
+      array biases(s.shape(), s.dtype(), nullptr, {});
+      biases.set_data(allocator::malloc(biases.nbytes()));
+      if (s.dtype() == float32) {
+        auto sp = s.data<float>();
+        auto bp = biases.data<float>();
+        for (size_t i = 0; i < s.size(); ++i) bp[i] = sp[i] * -0.5f;
+      } else if (s.dtype() == float16) {
+        auto sp = s.data<float16_t>();
+        auto bp = biases.data<float16_t>();
+        for (size_t i = 0; i < s.size(); ++i) bp[i] = float16_t(float(sp[i]) * -0.5f);
+      } else {
+        auto sp = s.data<bfloat16_t>();
+        auto bp = biases.data<bfloat16_t>();
+        for (size_t i = 0; i < s.size(); ++i) bp[i] = bfloat16_t(float(sp[i]) * -0.5f);
+      }
+      _qmm_dispatch(out, x, w, scales, biases, group_size_, bits_, transpose_);
+    });
   } else {
     encoder.dispatch([out = array::unsafe_weak_copy(out),
                       x = array::unsafe_weak_copy(x),
@@ -1249,8 +1277,30 @@ void fast::Quantize::eval_cpu(
   out.set_data(allocator::malloc(out.nbytes()));
 
   auto& scales = outputs[1];
-  auto& biases = outputs[2];
   scales.set_data(allocator::malloc(scales.nbytes()));
+
+  // sym1bit returns only {wq, scales} — no biases
+  if (mode_ == QuantizationMode::Sym1Bit) {
+    encoder.set_input_array(w);
+    encoder.set_output_array(out);
+    encoder.set_output_array(scales);
+    encoder.dispatch([w = array::unsafe_weak_copy(w),
+                      out = array::unsafe_weak_copy(out),
+                      scales = array::unsafe_weak_copy(scales),
+                      group_size_ = group_size_,
+                      bits_ = bits_]() mutable {
+      // fallback() will handle this; dispatch_quantize won't be called
+      // (sym1bit_quantize always returns via make_arrays → fallback path)
+      (void)w;
+      (void)out;
+      (void)scales;
+      (void)group_size_;
+      (void)bits_;
+    });
+    return;
+  }
+
+  auto& biases = outputs[2];
   biases.set_data(allocator::malloc(biases.nbytes()));
   encoder.set_input_array(w);
   encoder.set_input_array(scales);

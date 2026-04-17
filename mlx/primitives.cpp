@@ -3410,8 +3410,10 @@ std::string quantization_mode_to_string(QuantizationMode mode) {
     case QuantizationMode::Mxfp8:
       return "mxfp8";
     case QuantizationMode::Nvfp4:
-    default:
       return "nvfp4";
+    case QuantizationMode::Sym1Bit:
+    default:
+      return "sym1bit";
   }
 }
 
@@ -3426,6 +3428,8 @@ QuantizationMode string_to_quantization_mode(
     return QuantizationMode::Mxfp8;
   } else if (mode == "nvfp4") {
     return QuantizationMode::Nvfp4;
+  } else if (mode == "sym1bit") {
+    return QuantizationMode::Sym1Bit;
   }
   std::string msg;
   if (!tag.empty()) {

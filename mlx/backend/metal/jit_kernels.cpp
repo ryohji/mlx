@@ -858,7 +858,8 @@ MTL::ComputePipelineState* get_quantized_kernel(
         metal::utils(),
         metal::gemm(),
         metal::quantized_utils(),
-        (mode == "affine") ? metal::quantized() : metal::fp_quantized(),
+        (mode == "affine" || mode == "sym1bit") ? metal::quantized()
+                                                : metal::fp_quantized(),
         template_def);
     return kernel_source;
   });

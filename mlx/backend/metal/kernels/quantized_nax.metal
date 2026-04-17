@@ -61,6 +61,30 @@
   instantiate_quantized_batched(name, type, group_size, bits, 64, 64, 64, 2, 2, 1)      \
   instantiate_quantized_batched(name, type, group_size, bits, 64, 64, 64, 2, 2, 0)
 
+// sym1bit kernels have no bits template parameter (always 1) and no biases
+#define instantiate_sym1bit_aligned_batched(name, type, group_size, bm, bn, bk, wm, wn, aligned, batched) \
+  instantiate_kernel( \
+      #name "_" #type "_gs_" #group_size "_b_1_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn "_alN_" #aligned "_batch_" #batched, \
+      name, type, group_size, 1, aligned, batched, bm, bk, bn, wm, wn)
+
+#define instantiate_sym1bit_batched(name, type, group_size, bm, bn, bk, wm, wn, batched) \
+  instantiate_kernel( \
+      #name "_" #type "_gs_" #group_size "_b_1_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn "_batch_" #batched, \
+      name, type, group_size, 1, batched, bm, bk, bn, wm, wn)
+
+#define instantiate_sym1bit_all(type, group_size) \
+  instantiate_sym1bit_aligned_batched(sym1bit_qmm_t_nax, type, group_size, 64, 64, 64, 2, 2, true, 1) \
+  instantiate_sym1bit_aligned_batched(sym1bit_qmm_t_nax, type, group_size, 64, 64, 64, 2, 2, true, 0) \
+  instantiate_sym1bit_aligned_batched(sym1bit_qmm_t_nax, type, group_size, 64, 64, 64, 2, 2, false, 1) \
+  instantiate_sym1bit_aligned_batched(sym1bit_qmm_t_nax, type, group_size, 64, 64, 64, 2, 2, false, 0) \
+  instantiate_sym1bit_batched(sym1bit_qmm_n_nax, type, group_size, 64, 64, 64, 2, 2, 1) \
+  instantiate_sym1bit_batched(sym1bit_qmm_n_nax, type, group_size, 64, 64, 64, 2, 2, 0)
+
+#define instantiate_sym1bit_types(group_size) \
+  instantiate_sym1bit_all(float, group_size) \
+  instantiate_sym1bit_all(float16_t, group_size) \
+  instantiate_sym1bit_all(bfloat16_t, group_size)
+
 #define instantiate_quantized_all_batched(type, group_size, bits) \
   instantiate_quantized_batched_wrap(affine_qmm_n_nax, type, group_size, bits)
 
@@ -104,4 +128,9 @@
   instantiate_quantized_groups(6) \
   instantiate_quantized_groups(8)
 
-instantiate_quantized_all() // clang-format on
+instantiate_quantized_all()
+
+// sym1bit: group_size 128 and 64 (Bonsai uses 128)
+instantiate_sym1bit_types(128)
+instantiate_sym1bit_types(64)
+// clang-format on

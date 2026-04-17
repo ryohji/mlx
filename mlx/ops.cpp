@@ -4388,6 +4388,10 @@ std::pair<int, int> quantization_params_from_mode(
       default_group_size = 32;
       default_bits = 8;
       break;
+    case QuantizationMode::Sym1Bit:
+      default_group_size = 128;
+      default_bits = 1;
+      break;
   }
   return {
       group_size_.has_value() ? *group_size_ : default_group_size,
@@ -4426,6 +4430,23 @@ std::pair<Dtype, QuantizationMode> validate_mode_with_type(
       return {*out_type, qmode};
     } else {
       return {dtype, qmode};
+    }
+  } else if (qmode == QuantizationMode::Sym1Bit) {
+    if (biases) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] Biases must be null for sym1bit quantization.";
+      throw std::invalid_argument(msg.str());
+    }
+    if (!issubdtype(scales.dtype(), floating)) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] scales must be floating point for sym1bit but "
+          << "got dtype " << scales.dtype() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    if (out_type.has_value()) {
+      return {*out_type, qmode};
+    } else {
+      return {scales.dtype(), qmode};
     }
   } else if (scales.dtype() != uint8) {
     std::ostringstream msg;
@@ -4806,6 +4827,58 @@ affine_quantize(const array& w, int group_size, int bits, StreamOrDevice s_) {
       {w});
 }
 
+std::vector<array> sym1bit_quantize(
+    const array& w,
+    int group_size,
+    int bits,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  auto fallback = [group_size, bits, s](
+                      const std::vector<array>& inputs) -> std::vector<array> {
+    auto& w = inputs[0];
+    auto wshape = w.shape();
+    wshape.back() = -1;
+
+    array eps(1e-7, float32);
+    array two(2.0f, float32);
+
+    // Reshape into (n_groups, group_size)
+    array packed_w = reshape(w, {-1, w.shape(-1) / group_size, group_size}, s);
+
+    // scale = 2 * max(|w|) per group — symmetric α = scale/2
+    array w_abs_max = max(abs(packed_w, s), /* axis= */ -1, /* keepdims= */ true, s);
+    array scales = maximum(multiply(w_abs_max, two, s), eps, s);
+
+    // Synthesize bias = -scale/2 only for packing; not stored
+    array half_neg(-.5f, float32);
+    array biases_for_pack = multiply(scales, half_neg, s);
+
+    packed_w = pack_and_quantize(packed_w, scales, biases_for_pack, bits, s);
+
+    scales = astype(scales, w.dtype(), s);
+
+    auto sshape = w.shape();
+    sshape.back() = w.shape(-1) / group_size;
+    return {
+        reshape(packed_w, wshape, s),
+        reshape(scales, sshape, s),
+    };
+  };
+
+  auto wq_shape = w.shape();
+  wq_shape.back() = w.shape(-1) * bits / 32;
+  auto sshape = w.shape();
+  sshape.back() = w.shape(-1) / group_size;
+  // Always use fallback (quantize is offline; no Metal kernel needed)
+  return array::make_arrays(
+      {std::move(wq_shape), sshape},
+      {uint32, w.dtype()},
+      std::make_shared<fast::Quantize>(
+          s, fallback, group_size, bits, QuantizationMode::Sym1Bit, false),
+      {w});
+}
+
 std::vector<array> fp_quantize(
     const array& w,
     int group_size,
@@ -4954,6 +5027,8 @@ std::vector<array> quantize(
   validate_global_scale("quantize", qmode, global_scale);
   if (qmode == QuantizationMode::Affine) {
     return affine_quantize(w, group_size, bits, s);
+  } else if (qmode == QuantizationMode::Sym1Bit) {
+    return sym1bit_quantize(w, group_size, bits, s);
   } else {
     return fp_quantize(w, group_size, bits, qmode, global_scale, to_stream(s));
   }

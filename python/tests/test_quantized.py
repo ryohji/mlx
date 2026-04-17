@@ -263,6 +263,58 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 self.assertEqual(y_q.shape, y_hat.shape)
                 self.assertLess((y_q - y_hat).abs().max(), 1e-5)
 
+    def test_sym1bit_quantize(self):
+        """Symmetric 1-bit quantization: bias = -scale/2, so no biases buffer."""
+
+        key = mx.random.key(7)
+
+        for gs in [64, 128]:
+            with self.subTest(gs=gs):
+                # quantize returns exactly 2 tensors (w_q, scales) — no biases
+                w = mx.random.normal(shape=(128, 512), key=key)
+                result = mx.quantize(w, group_size=gs, bits=1, mode="sym1bit")
+                self.assertEqual(len(result), 2)
+                w_q, scales = result
+
+                # scales shape: (rows, cols // group_size)
+                self.assertEqual(scales.shape, (128, 512 // gs))
+
+                # For weights {-alpha, +alpha}, round-trip is exact.
+                alpha = 0.3
+                signs = (
+                    mx.random.uniform(shape=(128, 512), key=key) > 0.5
+                ).astype(mx.float32)
+                w_sym = signs * alpha + (1 - signs) * (-alpha)  # {-0.3, +0.3}
+                w_q2, s2 = mx.quantize(w_sym, group_size=gs, bits=1, mode="sym1bit")
+                # dequantize via affine with synthesized biases = -s/2
+                biases_synth = -s2 * 0.5
+                w_hat = mx.dequantize(w_q2, s2, biases_synth, gs, 1)
+                mx.eval(w_hat)
+                self.assertLess((w_sym - w_hat).abs().max().item(), 1e-4)
+
+        # quantized_matmul with mode="sym1bit" matches dequantize-then-matmul
+        k1, k2 = mx.random.split(key)
+        for gs in [64, 128]:
+            with self.subTest(gs=gs, case="qmm"):
+                x = mx.random.normal(shape=(4, 256), key=k1)
+                alpha = 0.25
+                signs = (
+                    mx.random.uniform(shape=(64, 256), key=k2) > 0.5
+                ).astype(mx.float32)
+                w_sym = signs * alpha + (1 - signs) * (-alpha)
+                w_q, scales = mx.quantize(w_sym, group_size=gs, bits=1, mode="sym1bit")
+                # reference: dequantize manually, then dense matmul
+                biases_ref = -scales * 0.5
+                w_hat = mx.dequantize(w_q, scales, biases_ref, gs, 1)
+                y_ref = x @ w_hat.T
+                # sym1bit quantized matmul
+                y_q = mx.quantized_matmul(
+                    x, w_q, scales, None, True, gs, 1, mode="sym1bit"
+                )
+                mx.eval(y_ref, y_q)
+                self.assertEqual(y_q.shape, y_ref.shape)
+                self.assertLess((y_q - y_ref).abs().max().item(), 1e-4)
+
     def test_qqmv(self):
         key = mx.random.key(0)
         k1, k2 = mx.random.split(key)
