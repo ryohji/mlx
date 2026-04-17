@@ -4832,7 +4832,10 @@ std::vector<array> sym1bit_quantize(
     int group_size,
     int bits,
     StreamOrDevice s_) {
-  auto s = to_stream(s_);
+  // sym1bit quantization is an offline weight-preparation step.
+  // Always run on CPU regardless of the caller's default device.
+  (void)s_;
+  auto s = default_stream(Device::cpu);
 
   auto fallback = [group_size, bits, s](
                       const std::vector<array>& inputs) -> std::vector<array> {
