@@ -1279,25 +1279,13 @@ void fast::Quantize::eval_cpu(
   auto& scales = outputs[1];
   scales.set_data(allocator::malloc(scales.nbytes()));
 
-  // sym1bit returns only {wq, scales} — no biases
-  if (mode_ == QuantizationMode::Sym1Bit) {
-    encoder.set_input_array(w);
-    encoder.set_output_array(out);
-    encoder.set_output_array(scales);
-    encoder.dispatch([w = array::unsafe_weak_copy(w),
-                      out = array::unsafe_weak_copy(out),
-                      scales = array::unsafe_weak_copy(scales),
-                      group_size_ = group_size_,
-                      bits_ = bits_]() mutable {
-      // fallback() will handle this; dispatch_quantize won't be called
-      // (sym1bit_quantize always returns via make_arrays → fallback path)
-      (void)w;
-      (void)out;
-      (void)scales;
-      (void)group_size_;
-      (void)bits_;
-    });
-    return;
+  // sym1bit quantize goes through sym1bit_quantize() in ops.cpp which uses
+  // plain MLX ops on the CPU stream — fast::Quantize::eval_cpu is never
+  // reached for sym1bit in the quantize (dequantize_=false) direction.
+  if (mode_ == QuantizationMode::Sym1Bit && !dequantize_) {
+    throw std::runtime_error(
+        "[sym1bit Quantize::eval_cpu] unexpected call for sym1bit quantize. "
+        "Use sym1bit_quantize() which runs as plain MLX ops on CPU.");
   }
 
   auto& biases = outputs[2];
